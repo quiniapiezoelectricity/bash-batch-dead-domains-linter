@@ -173,34 +173,54 @@ fetch_chunk() {
   return 0
 }
 
-# Pass loop: retry any chunk that still lacks a JSON file
+# 🌀 Process chunks loop (parallel batches)
 pass=1
-while :; do
+
+list_chunks() {
+  # Populate remaining_chunks with current chunk files (or empty)
+  local pattern="$BATCH_DIR/chunk_*"
+  # Ensure the array is declared (avoids nounset error)
+  remaining_chunks=()
+  if compgen -G "$pattern" > /dev/null; then
+    # nullglob behavior without changing shopt
+    remaining_chunks=( "$BATCH_DIR"/chunk_* )
+  else
+    remaining_chunks=()  # explicit empty
+  fi
+}
+
+while true; do
   echo "🔁 Pass #$pass — scanning for unprocessed chunks..."
-  shopt -s nullglob
-  remaining_chunks=( "$BATCH_DIR"/chunk_* )
-  shopt -u nullglob
 
-  # Determine unfinished chunks by absence of JSON
-  > "$RETRY_LIST"
-  for f in "${remaining_chunks[@]}"; do
-    [[ -f "$f" ]] || continue
-    chunk_name=$(basename "$f" .txt)
-    out_file="$OUT_DIR/${chunk_name}.json"
-    [[ -f "$out_file" ]] || echo "$f" >> "$RETRY_LIST"
-  done
+  # 1) Build a fresh list of chunk files
+  declare -a remaining_chunks=()
+  list_chunks
 
+  # 2) Build a retry list of chunks whose JSON is missing
+  : > "$RETRY_LIST"
+  if ((${#remaining_chunks[@]} > 0)); then
+    for f in "${remaining_chunks[@]}"; do
+      [[ -f "$f" ]] || continue
+      chunk_name=$(basename "$f" .txt)
+      out_file="$OUT_DIR/${chunk_name}.json"
+      [[ -f "$out_file" ]] || echo "$f" >> "$RETRY_LIST"
+    done
+  fi
+
+  # 3) If nothing to retry, we're done
   if [[ ! -s "$RETRY_LIST" ]]; then
     echo "✅ All chunks processed successfully!"
     break
   fi
 
+  # 4) Retry unfinished chunks in parallel batches
   to_retry=$(wc -l < "$RETRY_LIST" | tr -d ' ')
   echo "⚠️  Retrying $to_retry unfinished chunk(s)..."
 
   jobs=0
-  while read -r f; do
-    [[ -f "$f" ]] || continue
+  # Use the "${var[@]+"${var[@]}"}" idiom so nounset won't trip if empty
+  while IFS= read -r f; do
+    [[ -n "$f" && -f "$f" ]] || continue
     fetch_chunk "$f" &
     ((jobs++))
     if (( jobs >= MAX_PARALLEL )); then
@@ -215,6 +235,69 @@ while :; do
 
   ((pass++))
 done
+# 🌀 Process chunks loop (parallel batches)
+pass=1
+
+list_chunks() {
+  # Populate remaining_chunks with current chunk files (or empty)
+  local pattern="$BATCH_DIR/chunk_*"
+  # Ensure the array is declared (avoids nounset error)
+  remaining_chunks=()
+  if compgen -G "$pattern" > /dev/null; then
+    # nullglob behavior without changing shopt
+    remaining_chunks=( "$BATCH_DIR"/chunk_* )
+  else
+    remaining_chunks=()  # explicit empty
+  fi
+}
+
+while true; do
+  echo "🔁 Pass #$pass — scanning for unprocessed chunks..."
+
+  # 1) Build a fresh list of chunk files
+  declare -a remaining_chunks=()
+  list_chunks
+
+  # 2) Build a retry list of chunks whose JSON is missing
+  : > "$RETRY_LIST"
+  if ((${#remaining_chunks[@]} > 0)); then
+    for f in "${remaining_chunks[@]}"; do
+      [[ -f "$f" ]] || continue
+      chunk_name=$(basename "$f" .txt)
+      out_file="$OUT_DIR/${chunk_name}.json"
+      [[ -f "$out_file" ]] || echo "$f" >> "$RETRY_LIST"
+    done
+  fi
+
+  # 3) If nothing to retry, we're done
+  if [[ ! -s "$RETRY_LIST" ]]; then
+    echo "✅ All chunks processed successfully!"
+    break
+  fi
+
+  # 4) Retry unfinished chunks in parallel batches
+  to_retry=$(wc -l < "$RETRY_LIST" | tr -d ' ')
+  echo "⚠️  Retrying $to_retry unfinished chunk(s)..."
+
+  jobs=0
+  # Use the "${var[@]+"${var[@]}"}" idiom so nounset won't trip if empty
+  while IFS= read -r f; do
+    [[ -n "$f" && -f "$f" ]] || continue
+    fetch_chunk "$f" &
+    ((jobs++))
+    if (( jobs >= MAX_PARALLEL )); then
+      wait
+      echo "⏸ Cooling down ${BATCH_SLEEP}s..."
+      sleep "$BATCH_SLEEP"
+      jobs=0
+    fi
+  done < "$RETRY_LIST"
+  wait
+  rm -f "$RETRY_LIST"
+
+  ((pass++))
+done
+
 
 echo "📦 Merging all JSON responses..."
 jq -s 'add' "$OUT_DIR"/*.json > "$MERGED_JSON"
