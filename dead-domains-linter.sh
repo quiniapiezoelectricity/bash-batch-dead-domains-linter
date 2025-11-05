@@ -64,7 +64,7 @@ fetch_chunk() {
   post_data=$(awk '{printf "domain=%s&", $0}' "$f" | sed 's/&$//')
 
   # Perform the API request directly to file (so we can check exit + size)
-  if ! curl -sS --http1.1 --compressed --max-time 45 \
+  if ! curl -sS --http1.1 --compressed --max-time 60 \
       -A "$UA" -X POST -d "$post_data" "$API" -o "$out_file"; then
     echo "⚠️  Failed HTTP for chunk $chunk_name — requeueing."
     echo "$f" >> "$RETRY_LIST"
@@ -88,41 +88,39 @@ fetch_chunk() {
 # 🌀 Process chunks loop (parallel batches)
 pass=1
 while true; do
-  echo "🔁 Pass #$pass — checking for remaining chunks..."
-  # portable listing of remaining chunks (works on Bash 3.2+)
+  echo "🔁 Pass #$pass — scanning for unprocessed chunks..."
   shopt -s nullglob
   remaining_chunks=( "$BATCH_DIR"/chunk_* )
   shopt -u nullglob
 
-  if [[ ${#remaining_chunks[@]} -eq 0 ]]; then
+  # also check if any JSON responses are missing
+  for f in "${remaining_chunks[@]}"; do
+    [[ -f "$f" ]] || continue
+    chunk_name=$(basename "$f" .txt)
+    out_file="$OUT_DIR/${chunk_name}.json"
+    [[ -f "$out_file" ]] || echo "$f" >> "$RETRY_LIST"
+  done
+
+  if [[ ! -s "$RETRY_LIST" ]]; then
     echo "✅ All chunks processed successfully!"
     break
   fi
 
+  echo "⚠️  Found $(wc -l < "$RETRY_LIST") unfinished chunks — retrying..."
   jobs=0
-  for f in "${remaining_chunks[@]}"; do
+  while read -r f; do
     [[ -f "$f" ]] || continue
     fetch_chunk "$f" &
     ((jobs++))
     if (( jobs >= MAX_PARALLEL )); then
       wait
-      ((pass++))
-      echo "⏸ Cooling down ${BATCH_SLEEP}s before next batch..."
+      echo "⏸ Cooling down ${BATCH_SLEEP}s..."
       sleep "$BATCH_SLEEP"
       jobs=0
     fi
-  done
+  done < "$RETRY_LIST"
   wait
-
-  # Retry any failed chunks (sequential for stability)
-  if [[ -s "$RETRY_LIST" ]]; then
-    echo "⚠️  Retrying failed chunks..."
-    mv "$RETRY_LIST" tmp_retry.list
-    while read -r f; do
-      [[ -f "$f" ]] && fetch_chunk "$f"
-    done < tmp_retry.list
-    rm -f tmp_retry.list
-  fi
+  rm -f "$RETRY_LIST"
 
   ((pass++))
 done
