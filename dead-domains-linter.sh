@@ -28,7 +28,7 @@
 set -o errexit
 set -o nounset
 set -o pipefail
-
+set +e 
 # Defaults
 CHUNK_SIZE=500
 MAX_PARALLEL=4
