@@ -286,7 +286,7 @@ while true; do
     fetch_chunk "$f" &
     ((jobs++))
     if (( jobs >= MAX_PARALLEL )); then
-      wait
+      wait || true
       echo "⏸ Cooling down ${BATCH_SLEEP}s..."
       sleep "$BATCH_SLEEP"
       jobs=0
