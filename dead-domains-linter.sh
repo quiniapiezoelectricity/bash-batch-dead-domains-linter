@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # 🧰 dead-domains-checker.sh — AdGuard-compatible batch checker
-# Works on both macOS (BSD coreutils) and Linux (GNU coreutils)
+# Works on Linux and macOS runners (GNU/BSD userspace). Parallel curl enabled.
 # --------------------------------------------------------------
 
 API="https://urlfilter.adtidy.org/v2/checkDomains"
@@ -16,19 +16,27 @@ INACTIVE_LIST="$OUTPUT_DIR/inactive.txt"
 DNS_ALIVE_LIST="$OUTPUT_DIR/dns_alive.txt"
 DNS_DEAD_LIST="$OUTPUT_DIR/dns_dead.txt"
 
+# parallel knobs (override in env if needed)
+MAX_PARALLEL="${MAX_PARALLEL:-4}"     # 4–6 is the sweet spot on GH runners
+BATCH_SLEEP="${BATCH_SLEEP:-2}"       # pause between batches (seconds)
+UA="${UA:-AdCheckLite/0.3 (+github.com/quiniapiezoelectricity)}"
+
 mkdir -p "$BATCH_DIR" "$OUT_DIR" "$OUTPUT_DIR"
 
 echo "🧹 Cleaning up old temporary data..."
 rm -f "$BATCH_DIR"/chunk_* "$OUT_DIR"/*.json "$OUTPUT_DIR"/*.txt "$RETRY_LIST" 2>/dev/null || true
 
-# 🧩 Split input into chunks (portable across Linux/macOS)
+# 🧩 Split input into chunks
 INPUT_FILE="${1:-domains.txt}"
 if [[ ! -f "$INPUT_FILE" ]]; then
   echo "❌ Input file not found: $INPUT_FILE"
   exit 1
 fi
 
-split -l "$CHUNK_SIZE" -d -a 3 "$INPUT_FILE" "$BATCH_DIR/chunk_"
+# Note: macOS BSD split may lack -d; on GH Ubuntu it's available.
+split -l "$CHUNK_SIZE" -d -a 3 "$INPUT_FILE" "$BATCH_DIR/chunk_" || {
+  echo "❌ split failed"; exit 1;
+}
 for f in "$BATCH_DIR"/chunk_*; do
   mv "$f" "$f.txt"
 done
@@ -45,55 +53,68 @@ echo "✅ Split input into $chunks_count chunks."
 # 🧠 Helper: Fetch a single chunk
 fetch_chunk() {
   local f="$1"
-  local chunk_name
+  local chunk_name out_file post_data http_ok
+
   chunk_name=$(basename "$f" .txt)
-  local out_file="$OUT_DIR/${chunk_name}.json"
+  out_file="$OUT_DIR/${chunk_name}.json"
 
-  echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
   printf "🧩 Processing %-10s (%8d domains)\n" "$chunk_name" "$(wc -l < "$f")"
-  echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 
-  # Prepare POST data
+  # Prepare POST data (domain=a&domain=b&...)
   post_data=$(awk '{printf "domain=%s&", $0}' "$f" | sed 's/&$//')
 
-  # Perform the API request
-  response=$(curl -s -X POST -d "$post_data" "$API" --max-time 45)
-  if [[ $? -ne 0 || -z "$response" ]]; then
-    echo "⚠️  Failed to fetch chunk $chunk_name — adding back to retry list."
+  # Perform the API request directly to file (so we can check exit + size)
+  if ! curl -sS --http1.1 --compressed --max-time 45 \
+      -A "$UA" -X POST -d "$post_data" "$API" -o "$out_file"; then
+    echo "⚠️  Failed HTTP for chunk $chunk_name — requeueing."
     echo "$f" >> "$RETRY_LIST"
+    rm -f "$out_file"
     return 1
   fi
 
-  echo "$response" > "$out_file"
-
-  # Basic JSON sanity check
-  if ! jq empty "$out_file" 2>/dev/null; then
-    echo "⚠️  Invalid JSON for chunk $chunk_name — requeueing."
+  # Sanity: non-empty JSON and valid parse
+  if [[ ! -s "$out_file" ]] || ! jq empty "$out_file" >/dev/null 2>&1; then
+    echo "⚠️  Invalid/empty JSON for chunk $chunk_name — requeueing."
     echo "$f" >> "$RETRY_LIST"
     rm -f "$out_file"
     return 1
   fi
 
   echo "✅ [$chunk_name] Done → saved to $out_file"
-  rm -f "$f" # delete processed chunk
+  rm -f "$f"  # delete processed chunk
   return 0
 }
 
-# 🌀 Process chunks loop
+# 🌀 Process chunks loop (parallel batches)
 pass=1
 while true; do
   echo "🔁 Pass #$pass — checking for remaining chunks..."
-  chunks_left=$(ls "$BATCH_DIR"/chunk_* 2>/dev/null | wc -l | tr -d ' ')
+  # portable listing of remaining chunks (works on Bash 3.2+)
+  shopt -s nullglob
+  remaining_chunks=( "$BATCH_DIR"/chunk_* )
+  shopt -u nullglob
 
-  if [[ "$chunks_left" -eq 0 ]]; then
+  if [[ ${#remaining_chunks[@]} -eq 0 ]]; then
     echo "✅ All chunks processed successfully!"
     break
   fi
 
-  while read -r f; do
-    [[ -f "$f" ]] && fetch_chunk "$f"
-  done < <(ls "$BATCH_DIR"/chunk_* 2>/dev/null)
+  jobs=0
+  for f in "${remaining_chunks[@]}"; do
+    [[ -f "$f" ]] || continue
+    fetch_chunk "$f" &
+    ((jobs++))
+    if (( jobs >= MAX_PARALLEL )); then
+      wait
+      ((pass++))
+      echo "⏸ Cooling down ${BATCH_SLEEP}s before next batch..."
+      sleep "$BATCH_SLEEP"
+      jobs=0
+    fi
+  done
+  wait
 
+  # Retry any failed chunks (sequential for stability)
   if [[ -s "$RETRY_LIST" ]]; then
     echo "⚠️  Retrying failed chunks..."
     mv "$RETRY_LIST" tmp_retry.list
@@ -104,7 +125,6 @@ while true; do
   fi
 
   ((pass++))
-  sleep 1
 done
 
 # 📦 Merge JSON responses
@@ -157,11 +177,8 @@ if [[ -s "$INACTIVE_LIST" ]]; then
   while IFS= read -r domain; do
     [[ -z "$domain" ]] && continue
     ((counter++))
-
-    # Trim whitespace
     domain=$(echo "$domain" | tr -d '[:space:]')
 
-    # Try DNS resolution
     if dig +time=2 +tries=1 +short @1.1.1.1 "$domain" >/dev/null 2>&1; then
       ((alive_count++))
       echo "[$counter/$total] ✅ DNS alive: $domain"
@@ -197,11 +214,9 @@ fi
 
 # 🧩 Merge all domains that are not dead
 echo "📦 Combining verified active domains..."
-
 VALIDATED_LIST="$OUTPUT_DIR/validated_domains.txt"
 touch "$VALIDATED_LIST"
 
-# Combine everything that passed either check
 cat "$ACTIVE_LIST" "$REGISTERED_LIST" "$DNS_ALIVE_LIST" 2>/dev/null \
   | grep -v '^[[:space:]]*$' \
   | sort -u > "$VALIDATED_LIST"
@@ -216,7 +231,6 @@ printf "✅ Total validated domains: %s\n" "$validated_count"
 printf "💀 Total confirmed dead:    %s\n" "$dead_count"
 echo "-----------------------------------------------------"
 
-# Optional preview for debugging
 if [[ "$DEBUG" -eq 1 ]]; then
   echo "🔎 Preview of validated domains:"
   head -n 10 "$VALIDATED_LIST"
